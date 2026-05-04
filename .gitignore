@@ -1,0 +1,15 @@
+# 実際の設定ファイル（APIキー等を含むため管理対象外）
+config.json
+
+# レビュー出力ディレクトリ
+reviews/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# WebDriver キャッシュ
+.wdm/
