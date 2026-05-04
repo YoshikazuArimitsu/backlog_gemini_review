@@ -1,0 +1,28 @@
+{
+  "backlog": {
+    "api_key": "YOUR_BACKLOG_API_KEY",
+    "space": "yourspace.backlog.jp"
+  },
+  "git": {
+    "repos": {
+      "MYPROJECT": {
+        "myrepo":    "C:\\repos\\myproject\\myrepo",
+        "otherrepo": "C:\\repos\\myproject\\otherrepo"
+      },
+      "ANOTHER": {
+        "anotherrepo": "C:\\repos\\another"
+      }
+    }
+  },
+  "chrome": {
+    "path": "",
+    "user_data_dir": "",
+    "profile": "Default",
+    "debug_port": 9222
+  },
+  "review": {
+    "output_dir": "reviews",
+    "max_diff_chars": 100000,
+    "post_to_backlog": false
+  }
+}

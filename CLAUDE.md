@@ -1,0 +1,3 @@
+- Windows環境で標準のPython・Powershellで動作します。
+- Backlog・Gitの操作はAPIキーを設定ファイルから読み込み、Backlog APIを利用して行ってください。
+- Gemini の操作は Chrome のログイン済アカウントを使用し、ブラウザ操作で行ってください。
