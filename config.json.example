@@ -15,14 +15,20 @@
     }
   },
   "chrome": {
-    "path": "",
-    "user_data_dir": "",
-    "profile": "Default",
+    "profile":    "Default",
     "debug_port": 9222
   },
   "review": {
-    "output_dir": "reviews",
-    "max_diff_chars": 100000,
-    "post_to_backlog": false
+    "output_dir":      "reviews",
+    "max_diff_chars":  100000,
+    "post_to_backlog": true
+  },
+  "monitor": {
+    "interval_seconds": 300,
+    "trigger_keyword":  "[AIReview]",
+    "targets": [
+      {"project_key": "MYPROJECT", "repo_name": "myrepo"},
+      {"project_key": "ANOTHER",   "repo_name": "anotherrepo"}
+    ]
   }
 }

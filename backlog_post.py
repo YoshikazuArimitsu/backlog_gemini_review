@@ -4,39 +4,69 @@ Backlog PR へのレビュー結果投稿モジュール
 
 - Gemini レスポンスからまとめ部分を抽出する
 - レビュー全文を Backlog にファイル添付としてアップロードする
-- まとめを PR コメントとして投稿する
+- まとめを PR コメントとして投稿・更新する
+- reviewed_at メタデータを埋め込み、monitor.py による再レビュー判定に使用する
 """
 
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
 
 
-# ── コメント先頭に付与する自動レビュー明記ヘッダー ──────────────────────────
+# ── コメント識別マーカー ───────────────────────────────────────────────────
 # 注意: Backlog API は MySQL utf8(3バイト) を使用しているため絵文字等の
-#       4バイト Unicode 文字は送信できない。ヘッダーに絵文字を使わないこと。
+#       4バイト Unicode 文字は送信できない。マーカーに絵文字を使わないこと。
 
-# スクリプト投稿コメントの識別マーカー（先頭行）
+# レビュー本文コメントの識別マーカー（先頭行で完全一致確認）
 # ※ この文字列を変更すると既存コメントの検索に失敗するため慎重に変更すること
 _SCRIPT_COMMENT_MARKER = "[Gemini 自動コードレビュー]"
 
-COMMENT_HEADER = f"""\
-{_SCRIPT_COMMENT_MARKER}
+# 添付ファイル専用コメントのマーカー（先頭行）
+_SCRIPT_ATTACH_MARKER = "[Gemini 自動コードレビュー - 添付ファイル]"
 
-> このコメントは Gemini AI を使用した自動レビュースクリプトにより生成されました。
-> レビュー全文は添付ファイルをご参照ください。
+# コメント内の reviewed_at メタデータ行を抽出する正規表現
+_REVIEWED_AT_RE = re.compile(r"^reviewed_at:\s*(\S+)", re.MULTILINE)
 
----
 
-"""
+def _build_comment_header(reviewed_at: str) -> str:
+    """
+    レビュー日時を埋め込んだコメントヘッダーを生成する。
 
-# ── Markdown 形式（ファイル保存テキスト）──────────────────────────────────
-# プロンプトで明示指定した固定見出し「## まとめ」
-_SUMMARY_MATOME_MD_RE = re.compile(
-    r"^##\s*まとめ",
-    re.MULTILINE,
-)
+    reviewed_at は ISO 8601 UTC 文字列（例: "2024-01-15T10:30:00Z"）。
+    monitor.py がこの値を使って PR 更新後の再レビュー要否を判定する。
+    """
+    return (
+        f"{_SCRIPT_COMMENT_MARKER}\n"
+        f"reviewed_at: {reviewed_at}\n"
+        f"\n"
+        f"> このコメントは Gemini AI を使用した自動レビュースクリプトにより生成されました。\n"
+        f"> レビュー全文は添付ファイルをご参照ください。\n"
+        f"\n"
+        f"---\n"
+        f"\n"
+    )
+
+
+def extract_reviewed_at(comment_text: str):
+    """
+    スクリプトコメントから reviewed_at タイムスタンプを抽出して datetime で返す。
+    見つからない・パース失敗の場合は None を返す。
+    """
+    m = _REVIEWED_AT_RE.search(comment_text)
+    if not m:
+        return None
+    try:
+        return datetime.fromisoformat(m.group(1).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+# ── まとめ抽出用正規表現 ───────────────────────────────────────────────────
+
+# Markdown 形式「## まとめ」（プロンプトで明示指定した固定見出し）
+_SUMMARY_MATOME_MD_RE = re.compile(r"^##\s*まとめ", re.MULTILINE)
 
 # その他のまとめ系見出し（Markdown 形式）
 _SUMMARY_HEADING_MD_RE = re.compile(
@@ -44,12 +74,9 @@ _SUMMARY_HEADING_MD_RE = re.compile(
     re.MULTILINE | re.IGNORECASE,
 )
 
-# ── innerText 形式（ブラウザレンダリング後）────────────────────────────────
-# Gemini の innerText では <h2>まとめ</h2> が「まとめ」単独行になる
-_SUMMARY_MATOME_PLAIN_RE = re.compile(
-    r"^まとめ\s*$",
-    re.MULTILINE,
-)
+# innerText 形式「まとめ」単独行
+# （Gemini の innerText では <h2>まとめ</h2> が「まとめ」単独行になる）
+_SUMMARY_MATOME_PLAIN_RE = re.compile(r"^まとめ\s*$", re.MULTILINE)
 
 # その他のまとめ系単独行（innerText 形式）
 _SUMMARY_HEADING_PLAIN_RE = re.compile(
@@ -57,17 +84,13 @@ _SUMMARY_HEADING_PLAIN_RE = re.compile(
     re.MULTILINE | re.IGNORECASE,
 )
 
-# ── 共通フォールバック ─────────────────────────────────────────────────────
-# 番号付きリスト形式の総合評価パターン（例: "7. **総合評価**"）
+# 番号付きリスト形式（例: "7. **総合評価**"）
 _SUMMARY_INLINE_RE = re.compile(
-    r"^[\d]+\.\s+\*\*(総合評価|まとめ|総評)\*\*",
-    re.MULTILINE,
+    r"^[\d]+\.\s+\*\*(総合評価|まとめ|総評)\*\*", re.MULTILINE
 )
 
 # 太字キーワード
-_SUMMARY_BOLD_RE = re.compile(
-    r"\*\*(総合評価|まとめ|総評|Summary)\*\*",
-)
+_SUMMARY_BOLD_RE = re.compile(r"\*\*(総合評価|まとめ|総評|Summary)\*\*")
 
 
 def extract_summary(response_text: str) -> str:
@@ -87,38 +110,31 @@ def extract_summary(response_text: str) -> str:
       6. 太字の総合評価キーワード以降
       7. 見つからない場合はテキスト全体を返す
     """
-    # 1. Markdown 形式「## まとめ」
     matches = list(_SUMMARY_MATOME_MD_RE.finditer(response_text))
     if matches:
         return response_text[matches[-1].start():].strip()
 
-    # 2. innerText 形式「まとめ」単独行
     matches = list(_SUMMARY_MATOME_PLAIN_RE.finditer(response_text))
     if matches:
         return response_text[matches[-1].start():].strip()
 
-    # 3. その他の Markdown まとめ系見出し
     matches = list(_SUMMARY_HEADING_MD_RE.finditer(response_text))
     if matches:
         return response_text[matches[-1].start():].strip()
 
-    # 4. その他の innerText まとめ系単独行
     matches = list(_SUMMARY_HEADING_PLAIN_RE.finditer(response_text))
     if matches:
         return response_text[matches[-1].start():].strip()
 
-    # 5. 番号付きリスト形式
     matches = list(_SUMMARY_INLINE_RE.finditer(response_text))
     if matches:
         return response_text[matches[-1].start():].strip()
 
-    # 6. 太字キーワード
     m = _SUMMARY_BOLD_RE.search(response_text)
     if m:
         line_start = response_text.rfind("\n", 0, m.start()) + 1
         return response_text[line_start:].strip()
 
-    # 7. フォールバック: 全文
     return response_text
 
 
@@ -133,6 +149,8 @@ def _sanitize_for_backlog(text: str) -> str:
     return "".join(c for c in text if ord(c) <= 0xFFFF)
 
 
+# ── Backlog API 操作関数 ───────────────────────────────────────────────────
+
 def get_pr_comments(
     space: str,
     api_key: str,
@@ -141,44 +159,36 @@ def get_pr_comments(
     pr_number: int,
 ) -> list:
     """
-    PR の全コメントを取得する（ページネーション対応）。
+    PR のコメント一覧を取得する。
 
     Backlog API: GET /api/v2/projects/{proj}/git/repositories/{repo}/pullRequests/{num}/comments
+    注意: このエンドポイントは offset をサポートしないため、count=100 の 1 回取得のみ行う。
     """
     url = (
         f"https://{space}/api/v2/projects/{project_key}"
         f"/git/repositories/{repo_name}/pullRequests/{pr_number}/comments"
     )
-    all_comments = []
-    offset = 0
-
-    while True:
-        resp = requests.get(
-            url,
-            params={"apiKey": api_key, "count": 100, "offset": offset, "order": "asc"},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        batch = resp.json()
-        if not batch:
-            break
-        all_comments.extend(batch)
-        if len(batch) < 100:
-            break
-        offset += 100
-
-    return all_comments
+    resp = requests.get(
+        url,
+        params={"apiKey": api_key, "count": 100, "order": "asc"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
 
 
 def _find_script_comments(comments: list) -> list:
     """
-    コメント一覧からこのスクリプトによる投稿を抽出する。
-    先頭行が _SCRIPT_COMMENT_MARKER と一致するコメントを対象とする。
+    コメント一覧からこのスクリプトによるレビュー本文コメントを抽出する。
+
+    先頭行が _SCRIPT_COMMENT_MARKER と完全一致するものを対象とする。
+    添付ファイル専用コメント（_SCRIPT_ATTACH_MARKER）は除外する。
     """
     result = []
     for c in comments:
         content = c.get("content") or ""
-        if content.startswith(_SCRIPT_COMMENT_MARKER):
+        first_line = content.split("\n")[0].strip()
+        if first_line == _SCRIPT_COMMENT_MARKER:
             result.append(c)
     return result
 
@@ -195,7 +205,7 @@ def update_pr_comment(
     """
     PR コメントを更新する。
 
-    Backlog API: PATCH /api/v2/projects/{proj}/git/repositories/{repo}/pullRequests/{num}/comments/{commentId}
+    Backlog API: PATCH /api/v2/.../pullRequests/{num}/comments/{commentId}
     注意: PATCH は content のみ対応。attachmentId[] は指定不可。
     """
     url = (
@@ -220,7 +230,6 @@ def upload_attachment(space: str, api_key: str, file_path: str) -> int:
     """
     url = f"https://{space}/api/v2/space/attachment"
     file_name = Path(file_path).name
-
     with open(file_path, "rb") as f:
         resp = requests.post(
             url,
@@ -228,10 +237,8 @@ def upload_attachment(space: str, api_key: str, file_path: str) -> int:
             files={"file": (file_name, f, "text/markdown; charset=utf-8")},
             timeout=60,
         )
-
     resp.raise_for_status()
-    attachment_id = resp.json()["id"]
-    return attachment_id
+    return resp.json()["id"]
 
 
 def post_pr_comment(
@@ -246,18 +253,15 @@ def post_pr_comment(
     """
     Backlog PR にコメントを投稿する。
 
-    Backlog API: POST /api/v2/projects/{proj}/git/repositories/{repo}/pullRequests/{num}/comments
+    Backlog API: POST /api/v2/.../pullRequests/{num}/comments
     """
     url = (
         f"https://{space}/api/v2/projects/{project_key}"
         f"/git/repositories/{repo_name}/pullRequests/{pr_number}/comments"
     )
-
-    # requests は同名キーのリストを受け付けないため、リスト形式で組み立てる
     data = [("content", comment)]
     if attachment_id is not None:
         data.append(("attachmentId[]", attachment_id))
-
     resp = requests.post(url, params={"apiKey": api_key}, data=data, timeout=30)
     resp.raise_for_status()
     return resp.json()
@@ -271,15 +275,15 @@ def post_review_to_backlog(
     pr_number: int,
     response_text: str,
     full_review_path: str,
-) -> tuple[str, int]:
+) -> tuple:
     """
     レビュー結果を Backlog PR にコメント＋添付ファイルで投稿する。
 
-    既存のスクリプトコメントがある場合:
-      - 最新の 1 件を新しいレビュー内容で PATCH 更新（コメント数を増やさない）
-      - 余分な古いコメントは「統合済み」テキストで上書き
-      - 添付ファイルは新規 POST で別コメントとして投稿
-      ※ Backlog API は PR コメントの削除をサポートしていないため更新で代替
+    既存スクリプトコメントがある場合:
+      - 最新 1 件を新レビュー内容で PATCH 更新（コメント数を増やさない）
+      - 余分なコメントは「統合済み」テキストで上書き
+      - 添付ファイルは _SCRIPT_ATTACH_MARKER 付きの別コメントで新規 POST
+      ※ Backlog API は PR コメントの削除をサポートしないため更新で代替
 
     既存コメントがない場合:
       - 添付ファイル付きで新規 POST
@@ -287,9 +291,12 @@ def post_review_to_backlog(
     Returns:
         (投稿・更新したコメント本文, Backlog コメント ID)
     """
+    # レビュー日時を UTC で記録（monitor.py の再レビュー判定に使用）
+    reviewed_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    header = _build_comment_header(reviewed_at)
+
     summary = extract_summary(response_text)
-    # 4バイト文字（絵文字等）を除去してから投稿（Backlog MySQL utf8 制限対応）
-    comment_body = _sanitize_for_backlog(COMMENT_HEADER + summary)
+    comment_body = _sanitize_for_backlog(header + summary)
 
     # ── 既存スクリプトコメントの確認 ─────────────────────────────────────────
     print(f"  PR #{pr_number} の既存スクリプトコメントを確認中...")
@@ -297,12 +304,11 @@ def post_review_to_backlog(
     script_comments = _find_script_comments(all_comments)
 
     if script_comments:
-        # 最新コメント（リストの末尾）を新しいレビューで更新
         target = script_comments[-1]
         target_id = target["id"]
         print(f"  既存コメントを更新中 (comment_id: {target_id}, 計 {len(script_comments)} 件検出)...")
 
-        # 余分な古いコメントがあれば最小テキストで上書き（異常系対応）
+        # 余分な古いコメントを最小テキストで上書き（異常系対応）
         placeholder = _sanitize_for_backlog(
             f"{_SCRIPT_COMMENT_MARKER}\n\n> このコメントは最新のレビューに統合されました。"
         )
@@ -318,11 +324,11 @@ def post_review_to_backlog(
         comment_id = result.get("id", target_id)
         print(f"  コメント更新完了 (comment_id: {comment_id})")
 
-        # PATCH は attachmentId[] 非対応のため、添付ファイルは別コメントで投稿
+        # PATCH は attachmentId[] 非対応のため添付ファイルは別コメントで POST
         print(f"  全文ファイルを Backlog にアップロード中: {Path(full_review_path).name}")
         attachment_id = upload_attachment(space, api_key, full_review_path)
         attach_note = _sanitize_for_backlog(
-            f"{_SCRIPT_COMMENT_MARKER}\n\n上記レビューの全文ファイルです。"
+            f"{_SCRIPT_ATTACH_MARKER}\n\n上記レビューの全文ファイルです。"
         )
         post_pr_comment(
             space, api_key, project_key, repo_name, pr_number, attach_note, attachment_id
