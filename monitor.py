@@ -122,13 +122,15 @@ def _needs_review(pr: dict, comments: list, tolerance: int, repo_path: str = Non
     PR がレビューを必要とするか判定する。
 
     判定ロジック:
-      1. 既存スクリプトコメントがない          → True（未レビュー）
-      2. reviewed_at がない旧形式コメント      → True（再レビュー）
-      3. PR.updated - reviewed_at ≤ 許容秒数  → False（変更なし）
-      4. PR.updated - reviewed_at > 許容秒数 かつ
-           新規コミットあり（git log で確認）  → True（コード変更あり）
-           新規コミットなし                    → False（コメント等のみ）
-           git 確認不能                        → True（安全側で再レビュー）
+      1. 既存スクリプトコメントがない            → True（未レビュー）
+      2. reviewed_at がない旧形式コメント        → True（再レビュー）
+      3. repo_path が設定されている場合:
+           新規コミットあり（git log で確認）    → True（コード変更あり）
+           新規コミットなし                      → False（コード変更なし）
+           git 確認不能（fetch 失敗等）          → フォールバック(4)へ
+      4. repo_path 未設定 または git 確認不能:
+           PR.updated - reviewed_at > 許容秒数  → True（安全側で再レビュー）
+           PR.updated - reviewed_at ≤ 許容秒数  → False（変更なし）
 
     Returns:
         (bool: 要否, str: 理由メッセージ)
@@ -144,42 +146,45 @@ def _needs_review(pr: dict, comments: list, tolerance: int, repo_path: str = Non
     if reviewed_at is None:
         return True, "旧形式コメント（reviewed_at なし）→ 再レビューを実行"
 
+    reviewed_str = reviewed_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+    branch = pr.get("branch", "")
+
+    # ── 優先チェック: git コミット確認 ──────────────────────────────────────
+    if repo_path:
+        has_commits = _has_new_commits_since(repo_path, branch, reviewed_at)
+
+        if has_commits is True:
+            return True, (
+                f"新規コミットあり (reviewed: {reviewed_str}, branch: {branch})"
+                f" → 再レビューを実行"
+            )
+
+        if has_commits is False:
+            return False, (
+                f"新規コミットなし (reviewed: {reviewed_str}, branch: {branch})"
+                f" → スキップ"
+            )
+
+        # has_commits is None → git 確認失敗、フォールバックへ
+        fallback_reason = "git 確認失敗のためフォールバック"
+    else:
+        fallback_reason = "リポジトリ未設定のためフォールバック"
+
+    # ── フォールバック: PR.updated タイムスタンプで判定 ──────────────────────
     pr_updated = _parse_dt(pr.get("updated", ""))
     if pr_updated is None:
-        return False, "PR 更新日時が取得できないためスキップ"
+        return False, f"{fallback_reason}: PR 更新日時が取得できないためスキップ"
 
     diff_seconds = (pr_updated - reviewed_at).total_seconds()
 
-    if diff_seconds <= tolerance:
-        return False, f"変更なし (差分 {diff_seconds:.0f}s ≤ 許容 {tolerance}s) → スキップ"
-
-    # PR.updated が許容範囲を超えて更新されている → コミットを確認
-    branch = pr.get("branch", "")
-    reviewed_str  = reviewed_at.strftime("%Y-%m-%d %H:%M:%S UTC")
-    pr_upd_str    = pr_updated.strftime("%Y-%m-%d %H:%M:%S UTC")
-
-    if not repo_path:
+    if diff_seconds > tolerance:
         return True, (
-            f"PR 更新検出 (差分 {diff_seconds:.0f}s, リポジトリ未設定のためコミット確認スキップ)"
-            f" → 再レビューを実行"
-        )
-
-    has_commits = _has_new_commits_since(repo_path, branch, reviewed_at)
-
-    if has_commits is None:
-        return True, (
-            f"PR 更新検出 (差分 {diff_seconds:.0f}s, git 確認失敗のため安全側で判定)"
-            f" → 再レビューを実行"
-        )
-
-    if has_commits:
-        return True, (
-            f"新規コミットあり (reviewed: {reviewed_str}, pr_updated: {pr_upd_str})"
+            f"{fallback_reason}: PR 更新検出 (差分 {diff_seconds:.0f}s > 許容 {tolerance}s)"
             f" → 再レビューを実行"
         )
 
     return False, (
-        f"コミット変更なし (PR 更新はコメント等のみ, 差分 {diff_seconds:.0f}s)"
+        f"{fallback_reason}: 変更なし (差分 {diff_seconds:.0f}s ≤ 許容 {tolerance}s)"
         f" → スキップ"
     )
 
