@@ -82,9 +82,53 @@ def _parse_dt(s: str):
         return None
 
 
-def _needs_review(pr: dict, comments: list, tolerance: int) -> tuple:
+def _has_new_commits_since(repo_path: str, branch: str, since_dt: datetime):
+    """
+    ローカルリポジトリで since_dt 以降に branch へのコミットがあるか確認する。
+
+    git fetch 後に git log origin/{branch} --since={since_dt} を実行する。
+
+    Returns:
+        True  : 新規コミットあり
+        False : 新規コミットなし
+        None  : 判定不能（リポジトリなし・git エラー等）
+    """
+    repo = Path(repo_path)
+    if not repo.is_dir():
+        return None
+
+    # 最新状態を取得
+    subprocess.run(
+        ["git", "fetch", "--all", "--quiet"],
+        cwd=repo_path, capture_output=True, timeout=60,
+    )
+
+    # reviewed_at 以降のコミットを検索
+    since_str = since_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    result = subprocess.run(
+        ["git", "log", f"origin/{branch}", f"--since={since_str}", "--oneline"],
+        cwd=repo_path, capture_output=True, text=True,
+        encoding="utf-8", errors="replace", timeout=30,
+    )
+
+    if result.returncode != 0:
+        return None
+
+    return bool(result.stdout.strip())
+
+
+def _needs_review(pr: dict, comments: list, tolerance: int, repo_path: str = None) -> tuple:
     """
     PR がレビューを必要とするか判定する。
+
+    判定ロジック:
+      1. 既存スクリプトコメントがない          → True（未レビュー）
+      2. reviewed_at がない旧形式コメント      → True（再レビュー）
+      3. PR.updated - reviewed_at ≤ 許容秒数  → False（変更なし）
+      4. PR.updated - reviewed_at > 許容秒数 かつ
+           新規コミットあり（git log で確認）  → True（コード変更あり）
+           新規コミットなし                    → False（コメント等のみ）
+           git 確認不能                        → True（安全側で再レビュー）
 
     Returns:
         (bool: 要否, str: 理由メッセージ)
@@ -98,7 +142,6 @@ def _needs_review(pr: dict, comments: list, tolerance: int) -> tuple:
     reviewed_at = backlog_post.extract_reviewed_at(latest.get("content", ""))
 
     if reviewed_at is None:
-        # reviewed_at がない旧形式コメントは再レビュー対象にする
         return True, "旧形式コメント（reviewed_at なし）→ 再レビューを実行"
 
     pr_updated = _parse_dt(pr.get("updated", ""))
@@ -107,15 +150,38 @@ def _needs_review(pr: dict, comments: list, tolerance: int) -> tuple:
 
     diff_seconds = (pr_updated - reviewed_at).total_seconds()
 
-    if diff_seconds > tolerance:
+    if diff_seconds <= tolerance:
+        return False, f"変更なし (差分 {diff_seconds:.0f}s ≤ 許容 {tolerance}s) → スキップ"
+
+    # PR.updated が許容範囲を超えて更新されている → コミットを確認
+    branch = pr.get("branch", "")
+    reviewed_str  = reviewed_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+    pr_upd_str    = pr_updated.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    if not repo_path:
         return True, (
-            f"PR 更新検出 ("
-            f"reviewed: {reviewed_at.strftime('%Y-%m-%d %H:%M:%S')} UTC, "
-            f"pr_updated: {pr_updated.strftime('%Y-%m-%d %H:%M:%S')} UTC, "
-            f"差分 {diff_seconds:.0f}s) → 再レビューを実行"
+            f"PR 更新検出 (差分 {diff_seconds:.0f}s, リポジトリ未設定のためコミット確認スキップ)"
+            f" → 再レビューを実行"
         )
 
-    return False, f"変更なし (差分 {diff_seconds:.0f}s ≤ 許容 {tolerance}s) → スキップ"
+    has_commits = _has_new_commits_since(repo_path, branch, reviewed_at)
+
+    if has_commits is None:
+        return True, (
+            f"PR 更新検出 (差分 {diff_seconds:.0f}s, git 確認失敗のため安全側で判定)"
+            f" → 再レビューを実行"
+        )
+
+    if has_commits:
+        return True, (
+            f"新規コミットあり (reviewed: {reviewed_str}, pr_updated: {pr_upd_str})"
+            f" → 再レビューを実行"
+        )
+
+    return False, (
+        f"コミット変更なし (PR 更新はコメント等のみ, 差分 {diff_seconds:.0f}s)"
+        f" → スキップ"
+    )
 
 
 # ── レビュー実行 ──────────────────────────────────────────────────────────────
@@ -178,9 +244,21 @@ def _run_step2(
     return result.returncode == 0
 
 
+def _resolve_repo_path(config: dict, project_key: str, repo_name: str) -> str | None:
+    """config.json の git.repos からローカルリポジトリのパスを解決する。"""
+    repos = config.get("git", {}).get("repos", {})
+    entry = repos.get(project_key)
+    if isinstance(entry, dict):
+        return entry.get(repo_name)
+    if isinstance(entry, str):
+        return entry
+    return None
+
+
 def _process_pr(
     script_dir: Path,
     config_path: str,
+    config: dict,
     space: str,
     api_key: str,
     project_key: str,
@@ -206,7 +284,8 @@ def _process_pr(
         print(f"    [Error] コメント取得失敗: {e}")
         return "error"
 
-    needed, reason = _needs_review(pr, comments, tolerance)
+    repo_path = _resolve_repo_path(config, project_key, repo_name)
+    needed, reason = _needs_review(pr, comments, tolerance, repo_path)
     print(f"    {reason}")
 
     if not needed:
@@ -288,7 +367,7 @@ def _run_cycle(config: dict, config_path: str, script_dir: Path, args: object) -
             first_review_in_cycle = False
 
             result = _process_pr(
-                script_dir, config_path,
+                script_dir, config_path, config,
                 space, api_key,
                 project_key, repo_name, pr,
                 args.gemini_timeout, args.no_pro, tolerance,
