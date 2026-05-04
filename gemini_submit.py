@@ -131,6 +131,48 @@ def setup_driver(config: dict) -> webdriver.Chrome:
         raise SystemExit(1)
 
 
+def _close_gemini_tabs(driver: webdriver.Chrome) -> None:
+    """
+    開いているタブのうち Gemini のページ（gemini.google.com）を閉じる。
+    タブが 1 枚しかない場合は閉じずにそのまま残す（Chrome がタブ 0 枚になると
+    ウィンドウ自体が閉じてしまうため）。
+    """
+    gemini_handles = []
+    other_handles = []
+
+    for handle in driver.window_handles:
+        try:
+            driver.switch_to.window(handle)
+            if "gemini.google.com" in driver.current_url:
+                gemini_handles.append(handle)
+            else:
+                other_handles.append(handle)
+        except Exception:
+            other_handles.append(handle)
+
+    if not gemini_handles:
+        return
+
+    # 他のタブが残る場合は全ての Gemini タブを閉じる
+    # 他のタブが無い場合はウィンドウが消えないよう 1 枚だけ残す
+    closeable = gemini_handles if other_handles else gemini_handles[:-1]
+
+    for handle in closeable:
+        try:
+            driver.switch_to.window(handle)
+            driver.close()
+        except Exception:
+            pass
+
+    if closeable:
+        print(f"  既存の Gemini タブを {len(closeable)} 件閉じました。")
+
+    # 閉じた後は残っているタブにフォーカスを移す
+    remaining = [h for h in driver.window_handles]
+    if remaining:
+        driver.switch_to.window(remaining[-1])
+
+
 def switch_to_pro_model(driver: webdriver.Chrome, wait: WebDriverWait) -> None:
     """
     Gemini の Pro モードへの切り替えを試みる。
@@ -390,8 +432,9 @@ def main():
     driver = setup_driver(config)
 
     try:
-        # 既存タブの状態に依存しないよう、常に新規タブで Gemini を開く
-        # （前回の会話履歴や UI 状態が残っていても干渉しない）
+        # 既存の Gemini タブを閉じてからレビュー用タブを新規に開く
+        _close_gemini_tabs(driver)
+
         print("新規タブを開いています...")
         driver.switch_to.new_window("tab")
 
