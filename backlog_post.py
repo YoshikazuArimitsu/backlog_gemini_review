@@ -143,8 +143,17 @@ def extract_summary(response_text: str) -> str:
 
 # ── まとめ構造解析用正規表現 ─────────────────────────────────────────────────
 
-# 総合評価行（例: "総合評価: Approve"）
+# 総合評価行（例: "総合評価: 3"）
 _OVERALL_RE = re.compile(r"^総合評価[：:]\s*(.+)$", re.MULTILINE)
+
+# 総合評価 5 段階スコアの説明ラベル
+_SCORE_LABELS: dict[str, str] = {
+    "1": "致命的なバグ・エラーが存在し、マージしてはならない",
+    "2": "多くの対応必要な指摘事項が存在する",
+    "3": "いくつかの対応必要な指摘事項が存在する",
+    "4": "いくつか推奨事項は残っているが動作は問題なく、マージしても問題ない",
+    "5": "すぐ本番環境にマージして問題ない",
+}
 
 # 「主な指摘事項」見出し行（Markdown / innerText 両対応）
 _ISSUES_HEADING_RE = re.compile(r"^#{0,3}\s*主な指摘事項\s*$", re.MULTILINE)
@@ -161,7 +170,7 @@ def _parse_review_summary(summary_text: str) -> dict:
 
     Returns:
         {
-          "overall":    str   - 総合評価の値（例: "Approve"）
+          "overall":    str   - 総合評価のスコア（例: "3"）
           "issues":     list  - 主な指摘事項の文字列リスト
           "priorities": str   - 改善の優先度が高い点のテキスト
         }
@@ -213,7 +222,7 @@ def format_backlog_comment(response_text: str) -> str:
     出力形式:
         # まとめ
 
-        総合評価: **Approve**
+        総合評価: **3 / 5** — いくつかの対応必要な指摘事項が存在する状態
 
         ## 主な指摘事項
 
@@ -235,7 +244,12 @@ def format_backlog_comment(response_text: str) -> str:
     lines: list[str] = ["# まとめ", ""]
 
     if parsed["overall"]:
-        lines += [f"総合評価: **{parsed['overall']}**", ""]
+        score = parsed["overall"]
+        label = _SCORE_LABELS.get(score, "")
+        if label:
+            lines += [f"総合評価: **{score} / 5** — {label}", ""]
+        else:
+            lines += [f"総合評価: **{score}**", ""]
 
     if parsed["issues"]:
         lines += ["## 主な指摘事項", ""]
