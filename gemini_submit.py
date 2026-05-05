@@ -469,11 +469,29 @@ def main():
                 print("\n--- Backlog PR へのコメント投稿 ---")
                 space   = config["backlog"]["space"]
                 api_key = config["backlog"]["api_key"]
+
+                # PR 担当者を取得してメンション用の userId を解決する
+                assignee_user_id = ""
+                try:
+                    pr_info = backlog_post.get_pr(
+                        space, api_key,
+                        meta["project_key"], meta["repo_name"], pr_number_int,
+                    )
+                    assignee = pr_info.get("assignee") or {}
+                    assignee_user_id = assignee.get("userId", "")
+                    if assignee_user_id:
+                        print(f"  担当者: @{assignee_user_id} ({assignee.get('name', '')})")
+                    else:
+                        print("  担当者: 未設定")
+                except Exception as e:
+                    print(f"  [Warning] 担当者情報の取得に失敗しました: {e}")
+
                 try:
                     backlog_post.post_review_to_backlog(
                         space, api_key,
                         meta["project_key"], meta["repo_name"], pr_number_int,
                         response_text, full_path,
+                        assignee_user_id=assignee_user_id,
                     )
                 except Exception as e:
                     print(f"  [Warning] Backlog 投稿失敗: {e}")

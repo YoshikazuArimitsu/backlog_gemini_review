@@ -4,8 +4,11 @@ Backlog PR へのレビュー結果投稿モジュール
 
 - Gemini レスポンスからまとめ部分を抽出する
 - レビュー全文を Backlog にファイル添付としてアップロードする
-- まとめを PR コメントとして投稿・更新する
+- まとめを PR コメントとして新規投稿する
 - reviewed_at メタデータを埋め込み、monitor.py による再レビュー判定に使用する
+- 既存スクリプトコメントがある場合は擬似削除（プレースホルダーで上書き）し
+  添付ファイルは実削除してから新規コメントとして投稿する
+- PR 担当者へのメンションを先頭行に挿入する（assignee_user_id 指定時）
 """
 
 import re
@@ -151,6 +154,28 @@ def _sanitize_for_backlog(text: str) -> str:
 
 # ── Backlog API 操作関数 ───────────────────────────────────────────────────
 
+def get_pr(
+    space: str,
+    api_key: str,
+    project_key: str,
+    repo_name: str,
+    pr_number: int,
+) -> dict:
+    """
+    PR の詳細情報を取得する。
+
+    Backlog API: GET /api/v2/projects/{proj}/git/repositories/{repo}/pullRequests/{num}
+    担当者情報 (assignee.userId) などの取得に使用する。
+    """
+    url = (
+        f"https://{space}/api/v2/projects/{project_key}"
+        f"/git/repositories/{repo_name}/pullRequests/{pr_number}"
+    )
+    resp = requests.get(url, params={"apiKey": api_key}, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
 def get_pr_comments(
     space: str,
     api_key: str,
@@ -177,6 +202,61 @@ def get_pr_comments(
     return resp.json()
 
 
+def get_pr_attachments(
+    space: str,
+    api_key: str,
+    project_key: str,
+    repo_name: str,
+    pr_number: int,
+) -> list:
+    """
+    PR の添付ファイル一覧を取得する。
+
+    Backlog API: GET /api/v2/projects/{proj}/git/repositories/{repo}/pullRequests/{num}/attachments
+    各要素は {"id": int, "name": str, "size": int, ...} 形式。
+    """
+    url = (
+        f"https://{space}/api/v2/projects/{project_key}"
+        f"/git/repositories/{repo_name}/pullRequests/{pr_number}/attachments"
+    )
+    resp = requests.get(url, params={"apiKey": api_key}, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def delete_pr_attachment(
+    space: str,
+    api_key: str,
+    project_key: str,
+    repo_name: str,
+    pr_number: int,
+    attachment_id: int,
+) -> dict:
+    """
+    PR の添付ファイルを削除する。
+
+    Backlog API: DELETE /api/v2/projects/{proj}/git/repositories/{repo}/pullRequests/{num}/attachments/{id}
+    """
+    url = (
+        f"https://{space}/api/v2/projects/{project_key}"
+        f"/git/repositories/{repo_name}/pullRequests/{pr_number}/attachments/{attachment_id}"
+    )
+    resp = requests.delete(url, params={"apiKey": api_key}, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _find_comments_by_marker(comments: list, marker: str) -> list:
+    """先頭行が marker と完全一致するコメントを抽出する。"""
+    result = []
+    for c in comments:
+        content = c.get("content") or ""
+        first_line = content.split("\n")[0].strip()
+        if first_line == marker:
+            result.append(c)
+    return result
+
+
 def _find_script_comments(comments: list) -> list:
     """
     コメント一覧からこのスクリプトによるレビュー本文コメントを抽出する。
@@ -184,13 +264,7 @@ def _find_script_comments(comments: list) -> list:
     先頭行が _SCRIPT_COMMENT_MARKER と完全一致するものを対象とする。
     添付ファイル専用コメント（_SCRIPT_ATTACH_MARKER）は除外する。
     """
-    result = []
-    for c in comments:
-        content = c.get("content") or ""
-        first_line = content.split("\n")[0].strip()
-        if first_line == _SCRIPT_COMMENT_MARKER:
-            result.append(c)
-    return result
+    return _find_comments_by_marker(comments, _SCRIPT_COMMENT_MARKER)
 
 
 def update_pr_comment(
@@ -275,77 +349,109 @@ def post_review_to_backlog(
     pr_number: int,
     response_text: str,
     full_review_path: str,
+    assignee_user_id: str = "",
 ) -> tuple:
     """
-    レビュー結果を Backlog PR にコメント＋添付ファイルで投稿する。
+    レビュー結果を Backlog PR にコメント＋添付ファイルで新規投稿する。
 
     既存スクリプトコメントがある場合:
-      - 最新 1 件を新レビュー内容で PATCH 更新（コメント数を増やさない）
-      - 余分なコメントは「統合済み」テキストで上書き
-      - 添付ファイルは _SCRIPT_ATTACH_MARKER 付きの別コメントで新規 POST
-      ※ Backlog API は PR コメントの削除をサポートしないため更新で代替
+      - PR の添付ファイル一覧から本スクリプトがアップロードしたファイルを特定し削除する
+        （ファイル名が "_review_full.md" で終わるもの）
+      - 既存レビュー本文コメント・添付ファイルコメントをプレースホルダーで上書きして
+        擬似削除する（Backlog API は PR コメントの DELETE をサポートしないため）
+      - その後、新規コメントとして POST する
 
     既存コメントがない場合:
-      - 添付ファイル付きで新規 POST
+      - 添付ファイル付きで新規 POST する
+
+    assignee_user_id が指定された場合、コメント先頭行に @userId のメンションを挿入する。
 
     Returns:
-        (投稿・更新したコメント本文, Backlog コメント ID)
+        (投稿したコメント本文, Backlog コメント ID)
     """
     # レビュー日時を UTC で記録（monitor.py の再レビュー判定に使用）
     reviewed_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     header = _build_comment_header(reviewed_at)
 
+    # 担当者メンション行（指定時のみ先頭に付与）
+    mention_line = f"@{assignee_user_id}\n\n" if assignee_user_id else ""
+
     summary = extract_summary(response_text)
-    comment_body = _sanitize_for_backlog(header + summary)
+    comment_body = _sanitize_for_backlog(mention_line + header + summary)
 
     # ── 既存スクリプトコメントの確認 ─────────────────────────────────────────
     print(f"  PR #{pr_number} の既存スクリプトコメントを確認中...")
     all_comments = get_pr_comments(space, api_key, project_key, repo_name, pr_number)
     script_comments = _find_script_comments(all_comments)
+    attach_comments = _find_comments_by_marker(all_comments, _SCRIPT_ATTACH_MARKER)
 
-    if script_comments:
-        target = script_comments[-1]
-        target_id = target["id"]
-        print(f"  既存コメントを更新中 (comment_id: {target_id}, 計 {len(script_comments)} 件検出)...")
+    if script_comments or attach_comments:
+        total_old = len(script_comments) + len(attach_comments)
+        print(f"  既存コメントを検出 (レビュー: {len(script_comments)} 件, 添付: {len(attach_comments)} 件 / 計 {total_old} 件)")
 
-        # 余分な古いコメントを最小テキストで上書き（異常系対応）
-        placeholder = _sanitize_for_backlog(
-            f"{_SCRIPT_COMMENT_MARKER}\n\n> このコメントは最新のレビューに統合されました。"
+        # ── 既存の添付ファイルを削除 ─────────────────────────────────────────
+        # スクリプトがアップロードしたファイル名のパターンで識別する
+        try:
+            pr_attachments = get_pr_attachments(space, api_key, project_key, repo_name, pr_number)
+            review_attachments = [
+                a for a in pr_attachments
+                if a.get("name", "").endswith("_review_full.md")
+            ]
+            if review_attachments:
+                print(f"  既存の添付ファイルを削除中 ({len(review_attachments)} 件)...")
+                for att in review_attachments:
+                    try:
+                        delete_pr_attachment(
+                            space, api_key, project_key, repo_name, pr_number, att["id"]
+                        )
+                        print(f"    削除完了: {att['name']} (attachment_id: {att['id']})")
+                    except Exception as e:
+                        print(f"    [Warning] 添付ファイル削除失敗 (attachment_id: {att['id']}): {e}")
+            else:
+                print(f"  削除対象の添付ファイルなし")
+        except Exception as e:
+            print(f"  [Warning] 添付ファイル一覧取得失敗: {e}")
+
+        # ── 既存コメントをプレースホルダーで上書き（擬似削除）──────────────
+        review_placeholder = _sanitize_for_backlog(
+            f"{_SCRIPT_COMMENT_MARKER}\n\n> このコメントは最新のレビューに置き換えられました。"
         )
-        for old in script_comments[:-1]:
-            update_pr_comment(
-                space, api_key, project_key, repo_name, pr_number, old["id"], placeholder
-            )
-            print(f"    古いコメントを置換 (comment_id: {old['id']})")
-
-        result = update_pr_comment(
-            space, api_key, project_key, repo_name, pr_number, target_id, comment_body
+        attach_placeholder = _sanitize_for_backlog(
+            f"{_SCRIPT_ATTACH_MARKER}\n\n> この添付ファイルは削除されました。"
         )
-        comment_id = result.get("id", target_id)
-        print(f"  コメント更新完了 (comment_id: {comment_id})")
 
-        # PATCH は attachmentId[] 非対応のため添付ファイルは別コメントで POST
-        print(f"  全文ファイルを Backlog にアップロード中: {Path(full_review_path).name}")
-        attachment_id = upload_attachment(space, api_key, full_review_path)
-        attach_note = _sanitize_for_backlog(
-            f"{_SCRIPT_ATTACH_MARKER}\n\n上記レビューの全文ファイルです。"
-        )
-        post_pr_comment(
-            space, api_key, project_key, repo_name, pr_number, attach_note, attachment_id
-        )
-        print(f"  添付ファイル投稿完了 (attachment_id: {attachment_id})")
+        for c in script_comments:
+            try:
+                update_pr_comment(
+                    space, api_key, project_key, repo_name, pr_number, c["id"], review_placeholder
+                )
+                print(f"    既存レビューコメントを置換 (comment_id: {c['id']})")
+            except Exception as e:
+                print(f"    [Warning] コメント更新失敗 (comment_id: {c['id']}): {e}")
 
+        for c in attach_comments:
+            try:
+                update_pr_comment(
+                    space, api_key, project_key, repo_name, pr_number, c["id"], attach_placeholder
+                )
+                print(f"    既存添付コメントを置換 (comment_id: {c['id']})")
+            except Exception as e:
+                print(f"    [Warning] コメント更新失敗 (comment_id: {c['id']}): {e}")
+
+    # ── 新規コメントとして投稿（常に POST）───────────────────────────────────
+    print(f"  全文ファイルを Backlog にアップロード中: {Path(full_review_path).name}")
+    attachment_id = upload_attachment(space, api_key, full_review_path)
+    print(f"  アップロード完了 (attachment_id: {attachment_id})")
+
+    if assignee_user_id:
+        print(f"  PR #{pr_number} にコメントを新規投稿中 (担当者: @{assignee_user_id})...")
     else:
-        # 初回投稿: 添付ファイル付きで新規 POST
-        print(f"  全文ファイルを Backlog にアップロード中: {Path(full_review_path).name}")
-        attachment_id = upload_attachment(space, api_key, full_review_path)
-        print(f"  アップロード完了 (attachment_id: {attachment_id})")
-
         print(f"  PR #{pr_number} にコメントを新規投稿中...")
-        result = post_pr_comment(
-            space, api_key, project_key, repo_name, pr_number, comment_body, attachment_id
-        )
-        comment_id = result.get("id", -1)
-        print(f"  コメント投稿完了 (comment_id: {comment_id})")
+
+    result = post_pr_comment(
+        space, api_key, project_key, repo_name, pr_number, comment_body, attachment_id
+    )
+    comment_id = result.get("id", -1)
+    print(f"  コメント投稿完了 (comment_id: {comment_id})")
 
     return comment_body, comment_id
