@@ -322,23 +322,34 @@ def post_pr_comment(
     repo_name: str,
     pr_number: int,
     comment: str,
-    attachment_id: int = None,
+    attachment_ids: list = None,
+    notified_user_ids: list = None,
 ) -> dict:
     """
     Backlog PR にコメントを投稿する。
 
     Backlog API: POST /api/v2/.../pullRequests/{num}/comments
+    attachment_ids     : 添付ファイル ID のリスト（複数可）
+    notified_user_ids  : 通知先ユーザーの数値 ID のリスト
+                         （notifiedUserId[] パラメーター経由でメンション通知を送る）
     """
     url = (
         f"https://{space}/api/v2/projects/{project_key}"
         f"/git/repositories/{repo_name}/pullRequests/{pr_number}/comments"
     )
     data = [("content", comment)]
-    if attachment_id is not None:
-        data.append(("attachmentId[]", attachment_id))
+    for aid in (attachment_ids or []):
+        data.append(("attachmentId[]", aid))
+    for uid in (notified_user_ids or []):
+        data.append(("notifiedUserId[]", uid))
     resp = requests.post(url, params={"apiKey": api_key}, data=data, timeout=30)
     resp.raise_for_status()
     return resp.json()
+
+
+# このスクリプトが Backlog にアップロードする添付ファイルの識別サフィックス
+# 削除対象判定に使用する（プロンプトファイルとレビュー全文ファイル）
+_REVIEW_ATTACHMENT_SUFFIXES = ("_review_full.md", "_prompt.txt")
 
 
 def post_review_to_backlog(
@@ -350,21 +361,25 @@ def post_review_to_backlog(
     response_text: str,
     full_review_path: str,
     assignee_user_id: str = "",
+    assignee_id: int = 0,
+    prompt_file_path: str = "",
 ) -> tuple:
     """
     レビュー結果を Backlog PR にコメント＋添付ファイルで新規投稿する。
 
     既存スクリプトコメントがある場合:
-      - PR の添付ファイル一覧から本スクリプトがアップロードしたファイルを特定し削除する
-        （ファイル名が "_review_full.md" で終わるもの）
-      - 既存レビュー本文コメント・添付ファイルコメントをプレースホルダーで上書きして
-        擬似削除する（Backlog API は PR コメントの DELETE をサポートしないため）
+      - PR の添付ファイル一覧からスクリプトがアップロードしたファイルを特定し削除する
+        （_review_full.md・_prompt.txt で終わるもの）
+      - 既存レビュー本文コメント・添付コメントをプレースホルダーで上書きして擬似削除する
+        （Backlog API は PR コメントの DELETE をサポートしないため）
       - その後、新規コメントとして POST する
 
     既存コメントがない場合:
       - 添付ファイル付きで新規 POST する
 
-    assignee_user_id が指定された場合、コメント先頭行に @userId のメンションを挿入する。
+    assignee_user_id : 担当者のログイン ID。コメント本文先頭に @userId を挿入する。
+    assignee_id      : 担当者の数値 ID。notifiedUserId[] パラメーターで通知を送る。
+    prompt_file_path : プロンプトファイルのパス。指定時は添付ファイルとして一緒にアップロードする。
 
     Returns:
         (投稿したコメント本文, Backlog コメント ID)
@@ -390,16 +405,16 @@ def post_review_to_backlog(
         print(f"  既存コメントを検出 (レビュー: {len(script_comments)} 件, 添付: {len(attach_comments)} 件 / 計 {total_old} 件)")
 
         # ── 既存の添付ファイルを削除 ─────────────────────────────────────────
-        # スクリプトがアップロードしたファイル名のパターンで識別する
+        # スクリプトがアップロードしたファイル名のサフィックスで識別する
         try:
             pr_attachments = get_pr_attachments(space, api_key, project_key, repo_name, pr_number)
-            review_attachments = [
+            old_attachments = [
                 a for a in pr_attachments
-                if a.get("name", "").endswith("_review_full.md")
+                if any(a.get("name", "").endswith(s) for s in _REVIEW_ATTACHMENT_SUFFIXES)
             ]
-            if review_attachments:
-                print(f"  既存の添付ファイルを削除中 ({len(review_attachments)} 件)...")
-                for att in review_attachments:
+            if old_attachments:
+                print(f"  既存の添付ファイルを削除中 ({len(old_attachments)} 件)...")
+                for att in old_attachments:
                     try:
                         delete_pr_attachment(
                             space, api_key, project_key, repo_name, pr_number, att["id"]
@@ -438,18 +453,32 @@ def post_review_to_backlog(
             except Exception as e:
                 print(f"    [Warning] コメント更新失敗 (comment_id: {c['id']}): {e}")
 
-    # ── 新規コメントとして投稿（常に POST）───────────────────────────────────
-    print(f"  全文ファイルを Backlog にアップロード中: {Path(full_review_path).name}")
-    attachment_id = upload_attachment(space, api_key, full_review_path)
-    print(f"  アップロード完了 (attachment_id: {attachment_id})")
+    # ── 添付ファイルをアップロード（レビュー全文 + プロンプト）────────────────
+    upload_ids = []
 
+    print(f"  レビュー全文ファイルをアップロード中: {Path(full_review_path).name}")
+    review_att_id = upload_attachment(space, api_key, full_review_path)
+    upload_ids.append(review_att_id)
+    print(f"  アップロード完了 (attachment_id: {review_att_id})")
+
+    if prompt_file_path and Path(prompt_file_path).exists():
+        print(f"  プロンプトファイルをアップロード中: {Path(prompt_file_path).name}")
+        prompt_att_id = upload_attachment(space, api_key, prompt_file_path)
+        upload_ids.append(prompt_att_id)
+        print(f"  アップロード完了 (attachment_id: {prompt_att_id})")
+
+    # ── 新規コメントとして投稿（常に POST）───────────────────────────────────
+    notified = [assignee_id] if assignee_id else []
     if assignee_user_id:
-        print(f"  PR #{pr_number} にコメントを新規投稿中 (担当者: @{assignee_user_id})...")
+        print(f"  PR #{pr_number} にコメントを新規投稿中 (担当者: @{assignee_user_id} / notifiedUserId: {assignee_id})...")
     else:
         print(f"  PR #{pr_number} にコメントを新規投稿中...")
 
     result = post_pr_comment(
-        space, api_key, project_key, repo_name, pr_number, comment_body, attachment_id
+        space, api_key, project_key, repo_name, pr_number,
+        comment_body,
+        attachment_ids=upload_ids,
+        notified_user_ids=notified,
     )
     comment_id = result.get("id", -1)
     print(f"  コメント投稿完了 (comment_id: {comment_id})")
