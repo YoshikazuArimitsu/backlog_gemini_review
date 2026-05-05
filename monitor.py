@@ -70,6 +70,32 @@ def _get_pr_list(space: str, api_key: str, project_key: str, repo_name: str) -> 
     return all_prs
 
 
+# ── レビューディレクトリ管理 ──────────────────────────────────────────────────
+
+def _clean_review_dir(output_dir: str) -> None:
+    """
+    レビュー出力ディレクトリ内のファイルをすべて削除する。
+
+    監視サイクルの開始時に呼び出すことでファイルの無制限な増加を防ぐ。
+    ディレクトリが存在しない・空の場合は何もしない。
+    """
+    d = Path(output_dir)
+    if not d.is_dir():
+        return
+    files = [f for f in d.iterdir() if f.is_file()]
+    if not files:
+        return
+    deleted = 0
+    for f in files:
+        try:
+            f.unlink()
+            deleted += 1
+        except Exception as e:
+            print(f"  [Warning] ファイル削除失敗: {f.name}: {e}")
+    if deleted:
+        print(f"レビューディレクトリをクリア: {deleted} ファイルを削除 ({output_dir})")
+
+
 # ── レビュー要否判定 ──────────────────────────────────────────────────────────
 
 def _parse_dt(s: str):
@@ -331,6 +357,10 @@ def _run_cycle(config: dict, config_path: str, script_dir: Path, args: object) -
     print(f"監視サイクル開始: {now_str}")
     print(f"トリガーキーワード: {keyword}")
     print(f"{'=' * 60}")
+
+    # サイクル開始時にレビューディレクトリを消去してファイルが増え続けるのを防ぐ
+    output_dir = config.get("review", {}).get("output_dir", "reviews")
+    _clean_review_dir(output_dir)
 
     totals = {"reviewed": 0, "skipped": 0, "error": 0}
     first_review_in_cycle = True
