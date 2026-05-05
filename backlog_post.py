@@ -141,6 +141,114 @@ def extract_summary(response_text: str) -> str:
     return response_text
 
 
+# ── まとめ構造解析用正規表現 ─────────────────────────────────────────────────
+
+# 総合評価行（例: "総合評価: Approve"）
+_OVERALL_RE = re.compile(r"^総合評価[：:]\s*(.+)$", re.MULTILINE)
+
+# 「主な指摘事項」見出し行（Markdown / innerText 両対応）
+_ISSUES_HEADING_RE = re.compile(r"^#{0,3}\s*主な指摘事項\s*$", re.MULTILINE)
+
+# 「改善の優先度が高い点」見出し行（Markdown / innerText 両対応）
+_PRIORITIES_HEADING_RE = re.compile(r"^#{0,3}\s*改善の優先度が高い点\s*$", re.MULTILINE)
+
+
+def _parse_review_summary(summary_text: str) -> dict:
+    """
+    extract_summary() で取得したまとめテキストから構造化データを抽出する。
+
+    Gemini の innerText 形式（Markdown 装飾なし）および Markdown 形式の両方に対応。
+
+    Returns:
+        {
+          "overall":    str   - 総合評価の値（例: "Approve"）
+          "issues":     list  - 主な指摘事項の文字列リスト
+          "priorities": str   - 改善の優先度が高い点のテキスト
+        }
+    """
+    result: dict = {"overall": "", "issues": [], "priorities": ""}
+
+    # ── 総合評価 ──────────────────────────────────────────────────────────────
+    m = _OVERALL_RE.search(summary_text)
+    if m:
+        overall = m.group(1).strip()
+        # バッククォート・太字記号・引用符を除去して値だけ残す
+        overall = re.sub(r"[`*'\"]", "", overall).strip()
+        result["overall"] = overall
+
+    # ── 主な指摘事項 / 改善の優先度が高い点 セクション境界を決定 ──────────────
+    m_issues = _ISSUES_HEADING_RE.search(summary_text)
+    m_prio   = _PRIORITIES_HEADING_RE.search(summary_text)
+
+    if m_issues:
+        issues_start = m_issues.end()
+        issues_end   = m_prio.start() if m_prio else len(summary_text)
+        issues_block = summary_text[issues_start:issues_end]
+
+        issues = []
+        for line in issues_block.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            # 先頭の箇条書き記号・番号を除去（"- ", "* ", "• ", "1. " 等）
+            item = re.sub(r"^[\-\*•・]\s+", "", line)
+            item = re.sub(r"^\d+[\.。\)）]\s+", "", item).strip()
+            if item:
+                issues.append(item)
+        result["issues"] = issues
+
+    if m_prio:
+        prio_text = summary_text[m_prio.end():].strip()
+        # 先頭の箇条書き記号を除去
+        prio_text = re.sub(r"^[\-\*•・]\s+", "", prio_text, flags=re.MULTILINE).strip()
+        result["priorities"] = prio_text
+
+    return result
+
+
+def format_backlog_comment(response_text: str) -> str:
+    """
+    Gemini レスポンスから Backlog Markdown 形式のコメント本文を生成する。
+
+    出力形式:
+        # まとめ
+
+        総合評価: **Approve**
+
+        ## 主な指摘事項
+
+        * 指摘事項
+
+        ## 改善の優先度が高い点
+
+        改善内容
+
+    まとめセクションの構造解析に失敗した場合は extract_summary() の生テキストを返す。
+    """
+    summary_text = extract_summary(response_text)
+    parsed = _parse_review_summary(summary_text)
+
+    # いずれのフィールドも抽出できなかった場合はフォールバック
+    if not parsed["overall"] and not parsed["issues"] and not parsed["priorities"]:
+        return summary_text
+
+    lines: list[str] = ["# まとめ", ""]
+
+    if parsed["overall"]:
+        lines += [f"総合評価: **{parsed['overall']}**", ""]
+
+    if parsed["issues"]:
+        lines += ["## 主な指摘事項", ""]
+        for issue in parsed["issues"]:
+            lines += [f"* {issue}", ""]
+
+    if parsed["priorities"]:
+        lines += ["## 改善の優先度が高い点", ""]
+        lines += [parsed["priorities"], ""]
+
+    return "\n".join(lines).strip()
+
+
 def _sanitize_for_backlog(text: str) -> str:
     """
     Backlog API に投稿するテキストから 4 バイト Unicode 文字を除去する。
@@ -391,8 +499,8 @@ def post_review_to_backlog(
     # 担当者メンション行（指定時のみ先頭に付与）
     mention_line = f"@{assignee_user_id}\n\n" if assignee_user_id else ""
 
-    summary = extract_summary(response_text)
-    comment_body = _sanitize_for_backlog(mention_line + header + summary)
+    formatted = format_backlog_comment(response_text)
+    comment_body = _sanitize_for_backlog(mention_line + header + formatted)
 
     # ── 既存スクリプトコメントの確認 ─────────────────────────────────────────
     print(f"  PR #{pr_number} の既存スクリプトコメントを確認中...")
