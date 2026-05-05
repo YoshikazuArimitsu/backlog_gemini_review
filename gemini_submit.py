@@ -470,8 +470,9 @@ def main():
                 space   = config["backlog"]["space"]
                 api_key = config["backlog"]["api_key"]
 
-                # PR 担当者を取得してメンション用の userId を解決する
+                # PR 担当者を取得してメンション用の userId / 数値 ID を解決する
                 assignee_user_id = ""
+                assignee_id = 0
                 try:
                     pr_info = backlog_post.get_pr(
                         space, api_key,
@@ -479,8 +480,9 @@ def main():
                     )
                     assignee = pr_info.get("assignee") or {}
                     assignee_user_id = assignee.get("userId", "")
+                    assignee_id      = assignee.get("id", 0)
                     if assignee_user_id:
-                        print(f"  担当者: @{assignee_user_id} ({assignee.get('name', '')})")
+                        print(f"  担当者: @{assignee_user_id} (id: {assignee_id}, 名前: {assignee.get('name', '')})")
                     else:
                         print("  担当者: 未設定")
                 except Exception as e:
@@ -492,6 +494,8 @@ def main():
                         meta["project_key"], meta["repo_name"], pr_number_int,
                         response_text, full_path,
                         assignee_user_id=assignee_user_id,
+                        assignee_id=assignee_id,
+                        prompt_file_path=str(prompt_path),
                     )
                 except Exception as e:
                     print(f"  [Warning] Backlog 投稿失敗: {e}")
