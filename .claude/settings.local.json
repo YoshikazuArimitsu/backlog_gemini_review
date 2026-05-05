@@ -2,7 +2,11 @@
   "permissions": {
     "allow": [
       "WebFetch(domain:developer.nulab.com)",
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)",
+      "Bash(gh pr *)"
     ]
   }
 }
